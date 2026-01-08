@@ -28,6 +28,15 @@ if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
 }
 
+const cloudinary = require('cloudinary').v2;
+
+// Cloudinary Config
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         cb(null, uploadDir)
@@ -39,7 +48,7 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage: storage });
-app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
+// app.use('/uploads', express.static(path.join(__dirname, 'public/uploads'))); // Not needed if hosting on Cloudinary
 
 // Upload Route
 app.post('/upload', upload.single('profile_pic'), async (req, res) => {
@@ -47,19 +56,30 @@ app.post('/upload', upload.single('profile_pic'), async (req, res) => {
         return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
 
-    const fileUrl = `/uploads/${req.file.filename}`;
-    const userId = req.body.userId; // Expects INT if using Postgres SERIAL
+    const localFilePath = req.file.path;
+    const userId = req.body.userId;
 
-    if (userId) {
-        try {
-            await db.query('UPDATE users SET profile_pic = $1 WHERE id = $2', [fileUrl, userId]);
-            res.json({ success: true, url: fileUrl });
-        } catch (err) {
-            console.error(err);
-            res.status(500).json({ success: false, error: err.message });
+    try {
+        // Upload to Cloudinary
+        const result = await cloudinary.uploader.upload(localFilePath, {
+            folder: "vcturbo_avatars"
+        });
+
+        const cloudUrl = result.secure_url;
+
+        // Delete local file
+        fs.unlinkSync(localFilePath);
+
+        if (userId) {
+            await db.query('UPDATE users SET profile_pic = $1 WHERE id = $2', [cloudUrl, userId]);
         }
-    } else {
-        res.json({ success: true, url: fileUrl });
+
+        res.json({ success: true, url: cloudUrl });
+    } catch (err) {
+        console.error("Upload error:", err);
+        // Try to cleanup local file even on error
+        if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
