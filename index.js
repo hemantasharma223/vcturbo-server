@@ -24,11 +24,11 @@ io.on('connection', (socket) => {
     // --- AUTHENTICATION ---
     socket.on('auth:register', async ({ name, email, password }, callback) => {
         try {
-            const [result] = await db.query(
-                'INSERT INTO users (name, email, password) VALUES (?, ?, ?)',
+            const { rows } = await db.query(
+                'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id',
                 [name, email, password] // Plain text for MVP as requested
             );
-            callback({ success: true, userId: result.insertId });
+            callback({ success: true, userId: rows[0].id });
         } catch (err) {
             console.error(err);
             callback({ success: false, error: err.message });
@@ -37,8 +37,8 @@ io.on('connection', (socket) => {
 
     socket.on('auth:login', async ({ email, password }, callback) => {
         try {
-            const [rows] = await db.query(
-                'SELECT * FROM users WHERE email = ? AND password = ?',
+            const { rows } = await db.query(
+                'SELECT * FROM users WHERE email = $1 AND password = $2',
                 [email, password]
             );
 
@@ -65,14 +65,14 @@ io.on('connection', (socket) => {
         if (!userId) return callback({ success: false, error: "Not logged in" });
 
         try {
-            const [users] = await db.query('SELECT id FROM users WHERE email = ?', [toEmail]);
+            const { rows: users } = await db.query('SELECT id FROM users WHERE email = $1', [toEmail]);
             if (users.length === 0) return callback({ success: false, error: "User not found" });
 
             const friendId = users[0].id;
             if (friendId === userId) return callback({ success: false, error: "Cannot add yourself" });
 
             await db.query(
-                'INSERT INTO friends (user_id, friend_id, status) VALUES (?, ?, ?)',
+                'INSERT INTO friends (user_id, friend_id, status) VALUES ($1, $2, $3)',
                 [userId, friendId, 'pending']
             );
 
@@ -94,18 +94,18 @@ io.on('connection', (socket) => {
 
         try {
             // Get friends where user is sender
-            const [sent] = await db.query(`
+            const { rows: sent } = await db.query(`
                 SELECT u.id, u.name, u.email, f.status 
                 FROM friends f 
                 JOIN users u ON f.friend_id = u.id 
-                WHERE f.user_id = ?`, [userId]);
+                WHERE f.user_id = $1`, [userId]);
 
             // Get friends where user is receiver
-            const [received] = await db.query(`
+            const { rows: received } = await db.query(`
                 SELECT u.id, u.name, u.email, f.status 
                 FROM friends f 
                 JOIN users u ON f.user_id = u.id 
-                WHERE f.friend_id = ?`, [userId]);
+                WHERE f.friend_id = $1`, [userId]);
 
             callback({ success: true, friends: [...sent, ...received] });
         } catch (err) {
@@ -128,12 +128,12 @@ io.on('connection', (socket) => {
         try {
             if (accept) {
                 await db.query(
-                    'UPDATE friends SET status = ? WHERE user_id = ? AND friend_id = ?',
+                    'UPDATE friends SET status = $1 WHERE user_id = $2 AND friend_id = $3',
                     ['accepted', friendId, userId]
                 );
             } else {
                 await db.query(
-                    'DELETE FROM friends WHERE user_id = ? AND friend_id = ?',
+                    'DELETE FROM friends WHERE user_id = $1 AND friend_id = $2',
                     [friendId, userId]
                 );
             }
@@ -150,7 +150,7 @@ io.on('connection', (socket) => {
 
         try {
             await db.query(
-                'INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)',
+                'INSERT INTO messages (sender_id, receiver_id, message) VALUES ($1, $2, $3)',
                 [userId, toUserId, message]
             );
 
@@ -169,10 +169,10 @@ io.on('connection', (socket) => {
         if (!userId) return callback({ success: false });
 
         try {
-            const [rows] = await db.query(`
+            const { rows } = await db.query(`
                 SELECT * FROM messages 
-                WHERE (sender_id = ? AND receiver_id = ?) 
-                   OR (sender_id = ? AND receiver_id = ?)
+                WHERE (sender_id = $1 AND receiver_id = $2) 
+                   OR (sender_id = $3 AND receiver_id = $4)
                 ORDER BY timestamp ASC`,
                 [userId, withUserId, withUserId, userId]
             );
