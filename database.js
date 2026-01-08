@@ -1,21 +1,22 @@
 const mysql = require('mysql2/promise');
+require('dotenv').config();
 
 const dbConfig = {
-    host: process.env.MYSQL_HOST,
-    user: process.env.MYSQL_USER,
-    password: process.env.MYSQL_PASSWORD,
-    database: process.env.MYSQL_DATABASE || 'vcturbo',
-    port: process.env.MYSQL_PORT || 3306,
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
 };
 
 let pool;
 
-// Helper to mimic pg's { rows } structure
+// Helper to mimic pg's result structure { rows }
 const query = async (sql, params) => {
     if (!pool) await initDB();
     const start = Date.now();
     try {
-        const [rows] = await pool.query(sql, params);
+        // Use a wrapper to ensure we don't hang forever
+        const promise = pool.query(sql, params);
+        const [rows] = await promise;
         const duration = Date.now() - start;
         if (duration > 100) {
             console.log(`[SLOW QUERY] ${duration}ms: ${sql.substring(0, 100)}...`);
@@ -30,28 +31,23 @@ const query = async (sql, params) => {
 // Initialize DB and Tables
 const initDB = async () => {
     try {
-        // Connect without database first to create it if missing
-        const connection = await mysql.createConnection({
-            host: dbConfig.host,
-            user: dbConfig.user,
-            password: dbConfig.password,
-            port: dbConfig.port
-        });
-
-        await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\``);
+        // 1. Connect without database to create it if needed
+        const connection = await mysql.createConnection(dbConfig);
+        await connection.query(`CREATE DATABASE IF NOT EXISTS \`${process.env.DB_NAME || 'vcturbo'}\``);
         await connection.end();
 
-        // Create pool with DB
+        // 2. Create the pool with the database
         pool = mysql.createPool({
             ...dbConfig,
+            database: process.env.DB_NAME || 'vcturbo',
             waitForConnections: true,
             connectionLimit: 10,
             queueLimit: 0
         });
 
-        console.log(`Using database: ${dbConfig.database}`);
+        console.log(`Using database: ${process.env.DB_NAME || 'vcturbo'}`);
 
-        // Create Tables
+        // 3. Create Tables
         await query(`
             CREATE TABLE IF NOT EXISTS users (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -87,14 +83,15 @@ const initDB = async () => {
             )
         `);
 
-        console.log("Database and tables initialized successfully");
+        console.log("Database and tables initialized successfully (MySQL)");
     } catch (err) {
         console.error("Error initializing database:", err);
+        // Important: If this fails, the server should probably exit or retry
         process.exit(1);
     }
-};
+}
 
-// Trigger initialization
+// Initial trigger
 initDB();
 
 module.exports = { query };
