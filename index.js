@@ -1,6 +1,9 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 require('dotenv').config();
 const db = require('./database');
 
@@ -12,6 +15,58 @@ const io = new Server(server, {
         methods: ["GET", "POST"]
     }
 });
+
+// Configure Multer for file uploads
+const uploadDir = path.join(__dirname, 'public/uploads');
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        cb(null, uploadDir)
+    },
+    filename: function (req, file, cb) {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, uniqueSuffix + path.extname(file.originalname)); // unique filename
+    }
+});
+
+const upload = multer({ storage: storage });
+
+// Serve static files (uploaded images)
+app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
+
+// Upload Route
+app.post('/upload', upload.single('profile_pic'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ success: false, message: 'No file uploaded' });
+    }
+
+    // Construct the public URL
+    // NOTE: In production (Render), this URL structure depends on how you serve static files.
+    // For now we assume the server is accessible at the same base URL.
+    const fileUrl = `/uploads/${req.file.filename}`;
+
+    // If the request includes userId, let's update the database immediately
+    // Ideally user ID should come from valid auth token, but for now we trust the client or separate logic
+    // Using loose coupling: Client uploads, gets URL, then triggers socket to update profile if needed?
+    // OR client sends userID in body. Let's support userID in body.
+
+    const userId = req.body.userId;
+    if (userId) {
+        try {
+            await db.query('UPDATE users SET profile_pic = $1 WHERE id = $2', [fileUrl, userId]);
+            res.json({ success: true, url: fileUrl });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ success: false, error: err.message });
+        }
+    } else {
+        res.json({ success: true, url: fileUrl });
+    }
+});
+
 
 // State
 const activeSockets = new Map(); // socketId -> userId (INT)
@@ -37,7 +92,7 @@ io.on('connection', (socket) => {
     socket.on('auth:login', async ({ email, password }, callback) => {
         try {
             const { rows } = await db.query(
-                'SELECT * FROM users WHERE email = $1 AND password = $2',
+                'SELECT id, name, email, profile_pic FROM users WHERE email = $1 AND password = $2',
                 [email, password]
             );
 
@@ -58,6 +113,19 @@ io.on('connection', (socket) => {
         }
     });
 
+    // --- USER PROFILE UPDATE via Socket ---
+    socket.on('user:update_profile_pic', async ({ url }, callback) => {
+        const userId = activeSockets.get(socket.id);
+        if (!userId) return callback({ success: false, error: "Not logged in" });
+
+        try {
+            await db.query('UPDATE users SET profile_pic = $1 WHERE id = $2', [url, userId]);
+            callback({ success: true });
+        } catch (err) {
+            callback({ success: false, error: err.message });
+        }
+    });
+
     // --- USER SEARCH ---
     socket.on('user:search', async ({ query }, callback) => {
         const userId = activeSockets.get(socket.id);
@@ -66,7 +134,7 @@ io.on('connection', (socket) => {
         try {
             // Search by name or email, exclude self
             const { rows } = await db.query(
-                'SELECT id, name, email FROM users WHERE (name ILIKE $1 OR email ILIKE $1) AND id != $2 LIMIT 20',
+                'SELECT id, name, email, profile_pic FROM users WHERE (name ILIKE $1 OR email ILIKE $1) AND id != $2 LIMIT 20',
                 [`%${query}%`, userId]
             );
             callback({ success: true, users: rows });
@@ -112,14 +180,14 @@ io.on('connection', (socket) => {
         try {
             // Get friends where user is sender
             const { rows: sent } = await db.query(`
-                SELECT u.id, u.name, u.email, f.status 
+                SELECT u.id, u.name, u.email, u.profile_pic, f.status 
                 FROM friends f 
                 JOIN users u ON f.friend_id = u.id 
                 WHERE f.user_id = $1`, [userId]);
 
             // Get friends where user is receiver
             const { rows: received } = await db.query(`
-                SELECT u.id, u.name, u.email, f.status 
+                SELECT u.id, u.name, u.email, u.profile_pic, f.status 
                 FROM friends f 
                 JOIN users u ON f.user_id = u.id 
                 WHERE f.friend_id = $1`, [userId]);

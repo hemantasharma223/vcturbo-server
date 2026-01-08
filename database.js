@@ -22,9 +22,17 @@ async function initDB() {
                 name VARCHAR(255) NOT NULL,
                 email VARCHAR(255) NOT NULL UNIQUE,
                 password VARCHAR(255) NOT NULL,
+                profile_pic TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
+
+        // Migration for existing tables
+        try {
+            await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_pic TEXT');
+        } catch (e) {
+            console.log("Column profile_pic might already exist or error:", e.message);
+        }
 
         // Friends Table
         await client.query(`
