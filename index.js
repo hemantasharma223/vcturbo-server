@@ -17,8 +17,7 @@ const io = new Server(server, {
     }
 });
 
-// Connect to MongoDB
-connectDB();
+// Connect to MongoDB handled in startServer
 
 // Middleware
 app.use(express.json());
@@ -464,6 +463,22 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+
+const startServer = async () => {
+    try {
+        await connectDB();
+
+        // Ensure Indexes
+        await usersCol().createIndex({ email: 1 }, { unique: true });
+        console.log('Indexes ensured');
+
+        server.listen(PORT, () => {
+            console.log(`Server running on port ${PORT}`);
+        });
+    } catch (err) {
+        console.error('Failed to start server:', err);
+        process.exit(1);
+    }
+};
+
+startServer();
