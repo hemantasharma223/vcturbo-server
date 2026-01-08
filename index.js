@@ -4,9 +4,8 @@ const { Server } = require('socket.io');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { MongoClient, ObjectId } = require('mongodb');
 require('dotenv').config();
-const { connectDB, getDb } = require('./database');
+const db = require('./database');
 
 const app = express();
 const server = http.createServer(app);
@@ -17,12 +16,13 @@ const io = new Server(server, {
     }
 });
 
-// Connect to MongoDB handled in startServer
+// Initialize DB Tables
+db.initDB();
 
 // Middleware
 app.use(express.json());
 
-// Configure Multer for file uploads
+// Configure Multer
 const uploadDir = path.join(__dirname, 'public/uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
@@ -39,14 +39,7 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage: storage });
-
-// Serve static files
 app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
-
-// Helper to get collections
-const usersCol = () => getDb().collection('users');
-const friendsCol = () => getDb().collection('friends');
-const messagesCol = () => getDb().collection('messages');
 
 // Upload Route
 app.post('/upload', upload.single('profile_pic'), async (req, res) => {
@@ -55,14 +48,11 @@ app.post('/upload', upload.single('profile_pic'), async (req, res) => {
     }
 
     const fileUrl = `/uploads/${req.file.filename}`;
-    const userId = req.body.userId;
+    const userId = req.body.userId; // Expects INT if using Postgres SERIAL
 
     if (userId) {
         try {
-            await usersCol().updateOne(
-                { _id: new ObjectId(userId) },
-                { $set: { profile_pic: fileUrl } }
-            );
+            await db.query('UPDATE users SET profile_pic = $1 WHERE id = $2', [fileUrl, userId]);
             res.json({ success: true, url: fileUrl });
         } catch (err) {
             console.error(err);
@@ -74,70 +64,53 @@ app.post('/upload', upload.single('profile_pic'), async (req, res) => {
 });
 
 // State
-const activeSockets = new Map(); // socketId -> userId (String)
-const onlineUsers = new Map();   // userId (String) -> socketId
-
-// Helper to transform Mongo Doc to Client User Object (id map)
-const toClientUser = (doc) => {
-    if (!doc) return null;
-    return {
-        id: doc._id.toString(),
-        name: doc.name,
-        email: doc.email,
-        profile_pic: doc.profile_pic
-    };
-};
+const activeSockets = new Map(); // socketId -> userId (INT)
+const onlineUsers = new Map();   // userId (INT) -> socketId
 
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
-    // --- AUTHENTICATION ---
+    // --- AUTH ---
     socket.on('auth:register', async ({ name, email, password }, callback) => {
         try {
-            const existing = await usersCol().findOne({ email });
-            if (existing) {
-                return callback({ success: false, error: "Email already exists" });
-            }
-
-            const result = await usersCol().insertOne({
-                name,
-                email,
-                password, // Note: Hash this in production!
-                profile_pic: null,
-                createdAt: new Date()
-            });
-
-            callback({ success: true, userId: result.insertedId.toString() });
+            const { rows } = await db.query(
+                'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id',
+                [name, email, password]
+            );
+            callback({ success: true, userId: rows[0].id });
         } catch (err) {
             console.error(err);
+            if (err.code === '23505') { // Postgres Unique Violation
+                return callback({ success: false, error: "Email already exists" });
+            }
             callback({ success: false, error: err.message });
         }
     });
 
     socket.on('auth:login', async ({ email, password }, callback) => {
         try {
-            const user = await usersCol().findOne({ email, password });
+            const { rows } = await db.query(
+                'SELECT id, name, email, profile_pic FROM users WHERE email = $1 AND password = $2',
+                [email, password]
+            );
 
-            if (user) {
-                const userId = user._id.toString();
+            if (rows.length > 0) {
+                const user = rows[0]; // user.id is INT
 
-                // CLEAR STALE MAPPINGS
+                // Clear previous mappings
                 const prevUserId = activeSockets.get(socket.id);
-                if (prevUserId) {
-                    onlineUsers.delete(prevUserId);
-                }
+                if (prevUserId) onlineUsers.delete(prevUserId);
 
-                const oldSocketId = onlineUsers.get(userId);
+                const oldSocketId = onlineUsers.get(user.id);
                 if (oldSocketId && oldSocketId !== socket.id) {
-                    console.log(`User ${user.name} replacing socket ${oldSocketId} with ${socket.id}`);
                     activeSockets.delete(oldSocketId);
                 }
 
-                activeSockets.set(socket.id, userId);
-                onlineUsers.set(userId, socket.id);
+                activeSockets.set(socket.id, user.id);
+                onlineUsers.set(user.id, socket.id);
 
-                console.log(`User ${user.name} logged in. Total online: ${onlineUsers.size}`);
-                callback({ success: true, user: toClientUser(user) });
+                console.log(`User ${user.name} logged in. ID: ${user.id}`);
+                callback({ success: true, user: user });
             } else {
                 callback({ success: false, error: "Invalid credentials" });
             }
@@ -150,27 +123,10 @@ io.on('connection', (socket) => {
     socket.on('auth:logout', (callback) => {
         const userId = activeSockets.get(socket.id);
         if (userId) {
-            console.log(`User ${userId} requested explicit logout`);
             onlineUsers.delete(userId);
             activeSockets.delete(socket.id);
         }
         if (typeof callback === 'function') callback({ success: true });
-    });
-
-    // --- USER PROFILE UPDATE via Socket ---
-    socket.on('user:update_profile_pic', async ({ url }, callback) => {
-        const userId = activeSockets.get(socket.id);
-        if (!userId) return callback({ success: false, error: "Not logged in" });
-
-        try {
-            await usersCol().updateOne(
-                { _id: new ObjectId(userId) },
-                { $set: { profile_pic: url } }
-            );
-            callback({ success: true });
-        } catch (err) {
-            callback({ success: false, error: err.message });
-        }
     });
 
     // --- USER SEARCH ---
@@ -179,18 +135,10 @@ io.on('connection', (socket) => {
         if (!userId) return callback({ success: false, error: "Not logged in" });
 
         try {
-            console.log(`[SEARCH] query: "${query}", userId: ${userId}`);
-
-            const regex = new RegExp(query, 'i');
-            const users = await usersCol().find({
-                $and: [
-                    { _id: { $ne: new ObjectId(userId) } },
-                    { $or: [{ name: regex }, { email: regex }] }
-                ]
-            }).limit(20).toArray();
-
-            console.log(`[SEARCH] Found ${users.length} results`);
-            callback({ success: true, users: users.map(toClientUser) });
+            const sql = 'SELECT id, name, email, profile_pic FROM users WHERE (name ILIKE $1 OR email ILIKE $2) AND id != $3 LIMIT 20';
+            const params = [`%${query}%`, `%${query}%`, userId];
+            const { rows } = await db.query(sql, params);
+            callback({ success: true, users: rows });
         } catch (err) {
             console.error('[SEARCH ERROR]', err);
             if (typeof callback === 'function') callback({ success: false, error: err.message });
@@ -203,39 +151,27 @@ io.on('connection', (socket) => {
         if (!userId) return callback({ success: false, error: "Not logged in" });
 
         try {
-            const friend = await usersCol().findOne({ email: toEmail });
-            if (!friend) return callback({ success: false, error: "User not found" });
+            const { rows: users } = await db.query('SELECT id FROM users WHERE email = $1', [toEmail]);
+            if (users.length === 0) return callback({ success: false, error: "User not found" });
 
-            const friendId = friend._id.toString();
+            const friendId = users[0].id;
             if (friendId === userId) return callback({ success: false, error: "Cannot add yourself" });
 
-            // Check if request already exists
-            const userObjId = new ObjectId(userId);
-            const friendObjId = new ObjectId(friendId);
+            // Check existing
+            const { rows: existing } = await db.query(
+                'SELECT status FROM friends WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)',
+                [userId, friendId]
+            );
 
-            const existing = await friendsCol().findOne({
-                $or: [
-                    { requester: userObjId, recipient: friendObjId },
-                    { requester: friendObjId, recipient: userObjId }
-                ]
-            });
-
-            if (existing) {
-                if (existing.status === 'accepted') return callback({ success: false, error: "Already friends" });
-                return callback({ success: false, error: "Request already pending" });
+            if (existing.length > 0) {
+                if (existing[0].status === 'accepted') return callback({ success: false, error: "Already friends" });
+                return callback({ success: false, error: "Request pending" });
             }
 
-            await friendsCol().insertOne({
-                requester: userObjId,
-                recipient: friendObjId,
-                status: 'pending',
-                createdAt: new Date()
-            });
+            await db.query('INSERT INTO friends (user_id, friend_id, status) VALUES ($1, $2, $3)', [userId, friendId, 'pending']);
 
             const friendSocket = onlineUsers.get(friendId);
-            if (friendSocket) {
-                io.to(friendSocket).emit('friend:incoming_request', { fromUserId: userId });
-            }
+            if (friendSocket) io.to(friendSocket).emit('friend:incoming_request', { fromUserId: userId });
 
             callback({ success: true });
         } catch (err) {
@@ -245,137 +181,84 @@ io.on('connection', (socket) => {
 
     socket.on('friend:list', async () => {
         const userId = activeSockets.get(socket.id);
-        if (!userId) {
-            return socket.emit('friend:list:response', { success: false, error: "Not logged in" });
-        }
+        if (!userId) return socket.emit('friend:list:response', { success: false, error: "Not logged in" });
 
         try {
-            const userObjId = new ObjectId(userId);
+            // Sent Requests
+            const { rows: sent } = await db.query(`
+                SELECT u.id, u.name, u.email, u.profile_pic, f.status, 1 as is_sender 
+                FROM friends f 
+                JOIN users u ON f.friend_id = u.id 
+                WHERE f.user_id = $1`, [userId]);
 
-            // Aggregation to get details for both Sent and Received requests
-            const pipeline = [
-                {
-                    $match: {
-                        $or: [{ requester: userObjId }, { recipient: userObjId }]
-                    }
-                },
-                // Lookup requester details
-                {
-                    $lookup: {
-                        from: 'users',
-                        localField: 'requester',
-                        foreignField: '_id',
-                        as: 'requester_info'
-                    }
-                },
-                // Lookup recipient details
-                {
-                    $lookup: {
-                        from: 'users',
-                        localField: 'recipient',
-                        foreignField: '_id',
-                        as: 'recipient_info'
-                    }
-                },
-                { $unwind: { path: '$requester_info', preserveNullAndEmptyArrays: true } },
-                { $unwind: { path: '$recipient_info', preserveNullAndEmptyArrays: true } }
-            ];
+            // Received Requests
+            const { rows: received } = await db.query(`
+                SELECT u.id, u.name, u.email, u.profile_pic, f.status, 0 as is_sender 
+                FROM friends f 
+                JOIN users u ON f.user_id = u.id 
+                WHERE f.friend_id = $1`, [userId]);
 
-            const friends = await friendsCol().aggregate(pipeline).toArray();
-
-            const mappedFriends = friends.map(f => {
-                const isSender = f.requester.toString() === userId;
-                // If I am sender, I want recipient info. If I am recipient, I want sender info.
-                const otherUser = isSender ? f.recipient_info : f.requester_info;
-
-                if (!otherUser) return null; // Should not happen unless corrupted
-
-                return {
-                    id: otherUser._id.toString(),
-                    name: otherUser.name,
-                    email: otherUser.email,
-                    profile_pic: otherUser.profile_pic,
-                    status: f.status,
-                    is_sender: isSender ? 1 : 0
-                };
-            }).filter(Boolean);
-
-            socket.emit('friend:list:response', { success: true, friends: mappedFriends });
+            const allFriends = [...sent, ...received];
+            socket.emit('friend:list:response', { success: true, friends: allFriends });
         } catch (err) {
-            console.error('[FRIEND LIST ERROR]', err);
+            console.error(err);
             socket.emit('friend:list:response', { success: false, error: err.message });
         }
     });
 
     socket.on('friend:respond', async ({ friendId, accept }, callback) => {
         const userId = activeSockets.get(socket.id);
-        if (!userId) {
-            if (typeof callback === 'function') callback({ success: false, error: "Not logged in" });
-            return;
-        }
+        if (!userId) return callback({ success: false, error: "Not logged in" });
 
         try {
-            const userObjId = new ObjectId(userId);
-            const friendObjId = new ObjectId(friendId);
-
-            const query = {
-                $or: [
-                    { requester: friendObjId, recipient: userObjId },
-                    { requester: userObjId, recipient: friendObjId }
-                ]
-            };
+            // Update where REQUEST was made (requester=friendId, recipient=userId)
+            // Or allow responding if YOU made request? No.
+            // But we need to find the record.
+            // Simplified: Find record between these two.
 
             if (accept) {
-                await friendsCol().updateOne(query, { $set: { status: 'accepted' } });
+                // We update 'pending' to 'accepted'
+                // But specifically we want to match correct direction if possible, or just any direction?
+                // Safest to update where EITHER (u=me, f=him) OR (u=him, f=me).
+                await db.query(`
+                    UPDATE friends SET status = 'accepted' 
+                    WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)
+                `, [userId, friendId]);
             } else {
-                await friendsCol().deleteOne(query);
+                await db.query(`
+                    DELETE FROM friends 
+                    WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)
+                `, [userId, friendId]);
             }
-
             if (typeof callback === 'function') callback({ success: true });
 
-            // Notify both
             socket.emit('friend:list:refresh');
             const targetSocket = onlineUsers.get(friendId);
-            if (targetSocket) {
-                io.to(targetSocket).emit('friend:list:refresh');
-            }
+            if (targetSocket) io.to(targetSocket).emit('friend:list:refresh');
         } catch (err) {
-            console.error('[FRIEND RESPOND ERROR]', err);
-            if (typeof callback === 'function') callback({ success: false, error: err.message });
+            callback({ success: false, error: err.message });
         }
     });
 
-    async function checkFriendship(userAId, userBId) {
-        const count = await friendsCol().countDocuments({
-            $or: [
-                { requester: new ObjectId(userAId), recipient: new ObjectId(userBId) },
-                { requester: new ObjectId(userBId), recipient: new ObjectId(userAId) }
-            ],
-            status: 'accepted'
-        });
-        return count > 0;
-    }
-
-    // --- CHAT SYSTEM ---
+    // --- CHAT ---
     socket.on('chat:send', async ({ toUserId, message }, callback) => {
         const userId = activeSockets.get(socket.id);
         if (!userId) return callback({ success: false });
 
         try {
-            const isFriend = await checkFriendship(userId, toUserId);
-            if (!isFriend) return callback({ success: false, error: "You can only chat with friends." });
+            // Check friendship (simple count)
+            const { rows } = await db.query(`
+                SELECT 1 FROM friends 
+                WHERE ((user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)) 
+                AND status = 'accepted'`, [userId, toUserId]);
 
-            await messagesCol().insertOne({
-                sender: new ObjectId(userId),
-                receiver: new ObjectId(toUserId),
-                content: message,
-                timestamp: new Date()
-            });
+            if (rows.length === 0) return callback({ success: false, error: "Not friends" });
+
+            await db.query('INSERT INTO messages (sender_id, receiver_id, message) VALUES ($1, $2, $3)', [userId, toUserId, message]);
 
             const targetSocket = onlineUsers.get(toUserId);
-            if (targetSocket) {
-                io.to(targetSocket).emit('chat:receive', { fromUserId: userId, message });
-            }
+            if (targetSocket) io.to(targetSocket).emit('chat:receive', { fromUserId: userId, message });
+
             callback({ success: true });
         } catch (err) {
             callback({ success: false, error: err.message });
@@ -387,46 +270,25 @@ io.on('connection', (socket) => {
         if (!userId) return callback({ success: false });
 
         try {
-            const userObjId = new ObjectId(userId);
-            const withUserObjId = new ObjectId(withUserId);
-
-            const messages = await messagesCol().find({
-                $or: [
-                    { sender: userObjId, receiver: withUserObjId },
-                    { sender: withUserObjId, receiver: userObjId }
-                ]
-            }).sort({ timestamp: 1 }).toArray();
-
-            const clientMessages = messages.map(m => ({
-                id: m._id.toString(),
-                sender_id: m.sender.toString(),
-                receiver_id: m.receiver.toString(),
-                message: m.content,
-                timestamp: m.timestamp
-            }));
-
-            callback({ success: true, messages: clientMessages });
+            const { rows } = await db.query(`
+                SELECT id, sender_id, receiver_id, message, timestamp 
+                FROM messages 
+                WHERE (sender_id = $1 AND receiver_id = $2) 
+                   OR (sender_id = $2 AND receiver_id = $1)
+                ORDER BY timestamp ASC`, [userId, withUserId]);
+            callback({ success: true, messages: rows });
         } catch (err) {
             callback({ success: false, error: err.message });
         }
     });
 
-    // --- DIRECT CALL SIGNALING ---
+    // --- CALLS ---
     socket.on('call:request', async ({ toUserId, offer }) => {
         const userId = activeSockets.get(socket.id);
+        // Verify friendship? Yes.
         const targetSocket = onlineUsers.get(toUserId);
-
-        const isFriend = await checkFriendship(userId, toUserId);
-        if (!isFriend) {
-            socket.emit('call:error', { error: "Not friends" });
-            return;
-        }
-
         if (targetSocket) {
-            io.to(targetSocket).emit('call:incoming', {
-                fromUserId: userId,
-                offer: offer
-            });
+            io.to(targetSocket).emit('call:incoming', { fromUserId: userId, offer });
         }
     });
 
@@ -434,10 +296,7 @@ io.on('connection', (socket) => {
         const userId = activeSockets.get(socket.id);
         const targetSocket = onlineUsers.get(toUserId);
         if (targetSocket) {
-            io.to(targetSocket).emit('call:answer', {
-                fromUserId: userId,
-                answer: answer
-            });
+            io.to(targetSocket).emit('call:answer', { fromUserId: userId, answer });
         }
     });
 
@@ -445,10 +304,7 @@ io.on('connection', (socket) => {
         const userId = activeSockets.get(socket.id);
         const targetSocket = onlineUsers.get(toUserId);
         if (targetSocket) {
-            io.to(targetSocket).emit('call:ice-candidate', {
-                fromUserId: userId,
-                candidate: candidate
-            });
+            io.to(targetSocket).emit('call:ice-candidate', { fromUserId: userId, candidate });
         }
     });
 
@@ -463,22 +319,6 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-
-const startServer = async () => {
-    try {
-        await connectDB();
-
-        // Ensure Indexes
-        await usersCol().createIndex({ email: 1 }, { unique: true });
-        console.log('Indexes ensured');
-
-        server.listen(PORT, () => {
-            console.log(`Server running on port ${PORT}`);
-        });
-    } catch (err) {
-        console.error('Failed to start server:', err);
-        process.exit(1);
-    }
-};
-
-startServer();
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
