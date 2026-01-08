@@ -1,39 +1,27 @@
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg');
 require('dotenv').config();
 
-const pool = mysql.createPool({
+const pool = new Pool({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
+    port: process.env.PORT || 5432,
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
 
 async function initDB() {
     try {
-        // Create DB if not exists (Requires a connection without DB selected first if strictly needed, 
-        // but assumes DB_NAME exists or we create it via a raw connection first. 
-        // Let's try to connect to just host/user/pass to create DB.)
-        
-        const connection = await mysql.createConnection({
-            host: process.env.DB_HOST,
-            user: process.env.DB_USER,
-            password: process.env.DB_PASSWORD
-        });
-        
-        await connection.query(`CREATE DATABASE IF NOT EXISTS \`${process.env.DB_NAME}\``);
-        await connection.end();
+        const client = await pool.connect();
 
-        // Now tables
-        const db = await pool.getConnection();
-        
         console.log("Initializing Database Tables...");
 
-        await db.query(`
+        // Users Table
+        await client.query(`
             CREATE TABLE IF NOT EXISTS users (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
                 name VARCHAR(255) NOT NULL,
                 email VARCHAR(255) NOT NULL UNIQUE,
                 password VARCHAR(255) NOT NULL,
@@ -41,21 +29,23 @@ async function initDB() {
             )
         `);
 
-        await db.query(`
+        // Friends Table
+        await client.query(`
             CREATE TABLE IF NOT EXISTS friends (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
                 user_id INT NOT NULL,
                 friend_id INT NOT NULL,
-                status ENUM('pending', 'accepted') DEFAULT 'pending',
+                status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'accepted')),
                 FOREIGN KEY (user_id) REFERENCES users(id),
                 FOREIGN KEY (friend_id) REFERENCES users(id),
-                UNIQUE KEY unique_friendship (user_id, friend_id)
+                UNIQUE (user_id, friend_id)
             )
         `);
 
-        await db.query(`
+        // Messages Table
+        await client.query(`
             CREATE TABLE IF NOT EXISTS messages (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
                 sender_id INT NOT NULL,
                 receiver_id INT NOT NULL,
                 message TEXT NOT NULL,
@@ -66,7 +56,7 @@ async function initDB() {
         `);
 
         console.log("Database initialized successfully");
-        db.release();
+        client.release();
     } catch (err) {
         console.error("Error initializing database:", err);
     }
