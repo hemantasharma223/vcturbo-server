@@ -14,7 +14,6 @@ const io = new Server(server, {
 });
 
 // State
-let waitingQueue = [];
 const activeSockets = new Map(); // socketId -> userId (INT)
 const onlineUsers = new Map();   // userId (INT) -> socketId
 
@@ -53,6 +52,24 @@ io.on('connection', (socket) => {
             } else {
                 callback({ success: false, error: "Invalid credentials" });
             }
+        } catch (err) {
+            console.error(err);
+            callback({ success: false, error: err.message });
+        }
+    });
+
+    // --- USER SEARCH ---
+    socket.on('user:search', async ({ query }, callback) => {
+        const userId = activeSockets.get(socket.id);
+        if (!userId) return callback({ success: false, error: "Not logged in" });
+
+        try {
+            // Search by name or email, exclude self
+            const { rows } = await db.query(
+                'SELECT id, name, email FROM users WHERE (name ILIKE $1 OR email ILIKE $1) AND id != $2 LIMIT 20',
+                [`%${query}%`, userId]
+            );
+            callback({ success: true, users: rows });
         } catch (err) {
             console.error(err);
             callback({ success: false, error: err.message });
@@ -113,14 +130,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('friend:accept', async ({ requestId }, callback) => {
-        // requestId could be the id of the friend relationship or the friend's user_id
-        // Let's assume input is friend_id (the user who sent the request)
-        const userId = activeSockets.get(socket.id);
-        // We need to update the row where user_id = friend_id AND friend_id = userId
-    });
-
-    // Correcting accept logic to be simpler: receive friendId
     socket.on('friend:respond', async ({ friendId, accept }, callback) => {
         const userId = activeSockets.get(socket.id);
         if (!userId) return;
@@ -143,12 +152,25 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Helper to check friendship
+    async function checkFriendship(userA, userB) {
+        const { rows } = await db.query(`
+            SELECT 1 FROM friends 
+            WHERE ((user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)) 
+            AND status = 'accepted'
+        `, [userA, userB]);
+        return rows.length > 0;
+    }
+
     // --- CHAT SYSTEM ---
     socket.on('chat:send', async ({ toUserId, message }, callback) => {
         const userId = activeSockets.get(socket.id);
         if (!userId) return callback({ success: false });
 
         try {
+            const isFriend = await checkFriendship(userId, toUserId);
+            if (!isFriend) return callback({ success: false, error: "You can only chat with friends." });
+
             await db.query(
                 'INSERT INTO messages (sender_id, receiver_id, message) VALUES ($1, $2, $3)',
                 [userId, toUserId, message]
@@ -183,9 +205,17 @@ io.on('connection', (socket) => {
     });
 
     // --- DIRECT CALL SIGNALING ---
-    socket.on('call:request', ({ toUserId, offer }) => {
+    socket.on('call:request', async ({ toUserId, offer }) => {
         const userId = activeSockets.get(socket.id);
         const targetSocket = onlineUsers.get(toUserId);
+
+        const isFriend = await checkFriendship(userId, toUserId);
+        if (!isFriend) {
+            // If callback existed, we would return error, but here we just don't emit
+            // Or emit an error event back to sender
+            socket.emit('call:error', { error: "Not friends" });
+            return;
+        }
 
         if (targetSocket) {
             io.to(targetSocket).emit('call:incoming', {
@@ -217,32 +247,9 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- EXISTING RANDOM VIDEO CHAT ---
-    socket.on('join', () => {
-        waitingQueue = waitingQueue.filter(id => id !== socket.id);
-        waitingQueue.push(socket.id);
-        console.log(`User ${socket.id} joined random queue.`);
-
-        if (waitingQueue.length >= 2) {
-            const user1 = waitingQueue.shift();
-            const user2 = waitingQueue.shift();
-            io.to(user1).emit('match', { peerId: user2, initiator: true });
-            io.to(user2).emit('match', { peerId: user1, initiator: false });
-        }
-    });
-
-    // Reuse existing WebRTC events for RANDOM chat (peerId based)
-    socket.on('offer', (data) => io.to(data.to).emit('offer', { from: socket.id, offer: data.offer }));
-    socket.on('answer', (data) => io.to(data.to).emit('answer', { from: socket.id, answer: data.answer }));
-    socket.on('ice-candidate', (data) => io.to(data.to).emit('ice-candidate', { from: socket.id, candidate: data.candidate }));
-
-    socket.on('leave', (data) => {
-        waitingQueue = waitingQueue.filter(id => id !== socket.id);
-        if (data && data.to) io.to(data.to).emit('user-left', { from: socket.id });
-    });
+    // --- RANDOM CHAT REMOVED ---
 
     socket.on('disconnect', () => {
-        waitingQueue = waitingQueue.filter(id => id !== socket.id);
         const userId = activeSockets.get(socket.id);
         if (userId) {
             activeSockets.delete(socket.id);
