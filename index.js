@@ -4,7 +4,7 @@ const { Server } = require('socket.io');
 require('dotenv').config();
 
 const db = require('./db');
-const firebase = require('./firebase');
+
 
 const app = express();
 const server = http.createServer(app);
@@ -87,19 +87,7 @@ io.on('connection', (socket) => {
         if (typeof cb === 'function') cb({ success: true });
     });
 
-    // -------- FCM TOKEN --------
-    socket.on('auth:update_fcm_token', async ({ fcmToken }) => {
-        const userId = activeSockets.get(socket.id);
-        if (!userId) return;
-        try {
-            await db.execute(
-                "UPDATE users SET fcm_token = ? WHERE id = ?", 
-                [fcmToken, userId]
-            );
-        } catch (err) {
-            console.error("Failed to update FCM token:", err.message);
-        }
-    });
+
 
     // -------- FRIEND REQUEST --------
     socket.on('friend:request', async (data, cb) => {
@@ -276,23 +264,8 @@ io.on('connection', (socket) => {
             const targetSocket = onlineUsers.get(toUserId);
             if (targetSocket) {
                 io.to(targetSocket).emit('chat:receive', { fromUserId: userId, message });
-            } else {
-                // Send Push Notification if recipient is offline
-                try {
-                    const [users] = await db.execute("SELECT fcm_token FROM users WHERE id = ?", [toUserId]);
-                    const fcmToken = users[0]?.fcm_token;
-                    if (fcmToken) {
-                        firebase.messaging().send({
-                            token: fcmToken,
-                            notification: { title: "New Message", body: message },
-                            data: { type: "chat", senderId: userId.toString() },
-                            android: { priority: "high" }
-                        });
-                    }
-                } catch (fcmErr) {
-                    console.error("FCM Error:", fcmErr.message);
-                }
             }
+
 
             if (typeof cb === 'function') cb({ success: true });
         } catch (err) {
@@ -325,23 +298,8 @@ io.on('connection', (socket) => {
         const targetSocket = onlineUsers.get(toUserId);
         if (targetSocket) {
             io.to(targetSocket).emit('call:incoming', { fromUserId: userId, offer });
-        } else {
-            // Send Push for Call
-            try {
-                const [users] = await db.execute("SELECT fcm_token FROM users WHERE id = ?", [toUserId]);
-                const fcmToken = users[0]?.fcm_token;
-                if (fcmToken) {
-                    firebase.messaging().send({
-                        token: fcmToken,
-                        notification: { title: "Incoming Call", body: "Someone is calling you..." },
-                        data: { type: "call", senderId: userId.toString() },
-                        android: { priority: "high" }
-                    });
-                }
-            } catch (fcmErr) {
-                console.error("FCM Error:", fcmErr.message);
-            }
         }
+
     });
 
     socket.on('call:answer', ({ toUserId, answer }) => {
