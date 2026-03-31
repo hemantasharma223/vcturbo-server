@@ -1,14 +1,14 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 require('dotenv').config();
-const db = require('./database');
+
+const db = require('./db');
+const firebase = require('./firebase');
 
 const app = express();
 const server = http.createServer(app);
+
 const io = new Server(server, {
     cors: {
         origin: "*",
@@ -16,299 +16,331 @@ const io = new Server(server, {
     }
 });
 
-// Initialize DB Tables
-db.initDB();
-
-// Middleware
 app.use(express.json());
 
-// Configure Multer
-const uploadDir = path.join(__dirname, 'public/uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
+// ---------------- STATE ----------------
+const activeSockets = new Map(); // socketId -> userId
+const onlineUsers = new Map();   // userId -> socketId
 
-const cloudinary = require('cloudinary').v2;
-
-// Cloudinary Config
-cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET
-});
-
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, uploadDir)
-    },
-    filename: function (req, file, cb) {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + path.extname(file.originalname));
-    }
-});
-
-const upload = multer({ storage: storage });
-// app.use('/uploads', express.static(path.join(__dirname, 'public/uploads'))); // Not needed if hosting on Cloudinary
-
-// Upload Route
-app.post('/upload', upload.single('profile_pic'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ success: false, message: 'No file uploaded' });
-    }
-
-    const localFilePath = req.file.path;
-    const userId = req.body.userId;
-
-    try {
-        // Upload to Cloudinary
-        const result = await cloudinary.uploader.upload(localFilePath, {
-            folder: "vcturbo_avatars"
-        });
-
-        const cloudUrl = result.secure_url;
-
-        // Delete local file
-        fs.unlinkSync(localFilePath);
-
-        if (userId) {
-            await db.query('UPDATE users SET profile_pic = $1 WHERE id = $2', [cloudUrl, userId]);
-        }
-
-        res.json({ success: true, url: cloudUrl });
-    } catch (err) {
-        console.error("Upload error:", err);
-        // Try to cleanup local file even on error
-        if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// State
-const activeSockets = new Map(); // socketId -> userId (INT)
-const onlineUsers = new Map();   // userId (INT) -> socketId
-
+// ---------------- SOCKET ----------------
 io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
+    console.log("Connected:", socket.id);
 
-    // --- AUTH ---
-    socket.on('auth:register', async ({ name, email, password }, callback) => {
+    // -------- AUTH REGISTER --------
+    socket.on('auth:register', async (data, cb) => {
         try {
-            const { rows } = await db.query(
-                'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id',
+            const { name, email, password } = data;
+            if (!name || !email || !password) {
+                if (typeof cb === 'function') cb({ success: false, error: "Incomplete data" });
+                return;
+            }
+
+            // Check if email exists
+            const [existing] = await db.execute("SELECT id FROM users WHERE email = ?", [email]);
+            if (existing.length > 0) {
+                if (typeof cb === 'function') cb({ success: false, error: "Email already exists" });
+                return;
+            }
+
+            const [result] = await db.execute(
+                "INSERT INTO users (name, email, password) VALUES (?, ?, ?)", 
                 [name, email, password]
             );
-            callback({ success: true, userId: rows[0].id });
+
+            if (typeof cb === 'function') cb({ success: true, userId: result.insertId });
         } catch (err) {
-            console.error(err);
-            if (err.code === '23505') { // Postgres Unique Violation
-                return callback({ success: false, error: "Email already exists" });
-            }
-            callback({ success: false, error: err.message });
+            if (typeof cb === 'function') cb({ success: false, error: err.message });
         }
     });
 
-    socket.on('auth:login', async ({ email, password }, callback) => {
+    // -------- AUTH LOGIN --------
+    socket.on('auth:login', async ({ email, password }, cb) => {
         try {
-            const { rows } = await db.query(
-                'SELECT id, name, email, profile_pic FROM users WHERE email = $1 AND password = $2',
+            if (!email || !password) {
+                if (typeof cb === 'function') cb({ success: false, error: "Incomplete data" });
+                return;
+            }
+
+            const [rows] = await db.execute(
+                "SELECT id, name, email, profile_pic FROM users WHERE email = ? AND password = ?", 
                 [email, password]
             );
 
             if (rows.length > 0) {
-                const user = rows[0]; // user.id is INT
-
-                // Clear previous mappings
-                const prevUserId = activeSockets.get(socket.id);
-                if (prevUserId) onlineUsers.delete(prevUserId);
-
-                const oldSocketId = onlineUsers.get(user.id);
-                if (oldSocketId && oldSocketId !== socket.id) {
-                    activeSockets.delete(oldSocketId);
-                }
-
+                const user = rows[0];
                 activeSockets.set(socket.id, user.id);
                 onlineUsers.set(user.id, socket.id);
-
-                console.log(`User ${user.name} logged in. ID: ${user.id}`);
-                callback({ success: true, user: user });
+                if (typeof cb === 'function') cb({ success: true, user });
             } else {
-                callback({ success: false, error: "Invalid credentials" });
+                if (typeof cb === 'function') cb({ success: false, error: "Invalid credentials" });
             }
         } catch (err) {
-            console.error(err);
-            callback({ success: false, error: err.message });
+            if (typeof cb === 'function') cb({ success: false, error: err.message });
         }
     });
 
-    socket.on('auth:logout', (callback) => {
+    // -------- LOGOUT --------
+    socket.on('auth:logout', (cb) => {
         const userId = activeSockets.get(socket.id);
-        if (userId) {
-            onlineUsers.delete(userId);
-            activeSockets.delete(socket.id);
-        }
-        if (typeof callback === 'function') callback({ success: true });
+        if (userId) onlineUsers.delete(userId);
+        activeSockets.delete(socket.id);
+        if (typeof cb === 'function') cb({ success: true });
     });
 
-    // --- USER SEARCH ---
-    socket.on('user:search', async ({ query }, callback) => {
+    // -------- FCM TOKEN --------
+    socket.on('auth:update_fcm_token', async ({ fcmToken }) => {
         const userId = activeSockets.get(socket.id);
-        if (!userId) return callback({ success: false, error: "Not logged in" });
-
+        if (!userId) return;
         try {
-            const sql = 'SELECT id, name, email, profile_pic FROM users WHERE (name ILIKE $1 OR email ILIKE $2) AND id != $3 LIMIT 20';
-            const params = [`%${query}%`, `%${query}%`, userId];
-            const { rows } = await db.query(sql, params);
-            callback({ success: true, users: rows });
+            await db.execute(
+                "UPDATE users SET fcm_token = ? WHERE id = ?", 
+                [fcmToken, userId]
+            );
         } catch (err) {
-            console.error('[SEARCH ERROR]', err);
-            if (typeof callback === 'function') callback({ success: false, error: err.message });
+            console.error("Failed to update FCM token:", err.message);
         }
     });
 
-    // --- FRIEND SYSTEM ---
-    socket.on('friend:request', async ({ toEmail }, callback) => {
+    // -------- FRIEND REQUEST --------
+    socket.on('friend:request', async (data, cb) => {
         const userId = activeSockets.get(socket.id);
-        if (!userId) return callback({ success: false, error: "Not logged in" });
+        if (!userId) {
+            if (typeof cb === 'function') cb({ success: false, error: "Not logged in" });
+            return;
+        }
 
         try {
-            const { rows: users } = await db.query('SELECT id FROM users WHERE email = $1', [toEmail]);
-            if (users.length === 0) return callback({ success: false, error: "User not found" });
+            let friendId = data.friendId;
 
-            const friendId = users[0].id;
-            if (friendId === userId) return callback({ success: false, error: "Cannot add yourself" });
+            // Find via email if friendId not provided
+            if (!friendId && data.toEmail) {
+                const [users] = await db.execute("SELECT id FROM users WHERE email = ?", [data.toEmail]);
+                if (users.length === 0) {
+                    if (typeof cb === 'function') cb({ success: false, error: "User not found" });
+                    return;
+                }
+                friendId = users[0].id;
+            }
+
+            if (userId == friendId) {
+                if (typeof cb === 'function') cb({ success: false, error: "Cannot add yourself" });
+                return;
+            }
 
             // Check existing
-            const { rows: existing } = await db.query(
-                'SELECT status FROM friends WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)',
-                [userId, friendId]
+            const [existing] = await db.execute(
+                "SELECT status FROM friends WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
+                [userId, friendId, friendId, userId]
             );
 
             if (existing.length > 0) {
-                if (existing[0].status === 'accepted') return callback({ success: false, error: "Already friends" });
-                return callback({ success: false, error: "Request pending" });
+                const status = existing[0].status;
+                if (status === 'accepted') {
+                    if (typeof cb === 'function') cb({ success: false, error: "Already friends" });
+                } else {
+                    if (typeof cb === 'function') cb({ success: false, error: "Request pending" });
+                }
+                return;
             }
 
-            await db.query('INSERT INTO friends (user_id, friend_id, status) VALUES ($1, $2, $3)', [userId, friendId, 'pending']);
+            // Insert request
+            await db.execute(
+                "INSERT INTO friends (user_id, friend_id, status) VALUES (?, ?, 'pending')",
+                [userId, friendId]
+            );
 
-            const friendSocket = onlineUsers.get(friendId);
-            if (friendSocket) io.to(friendSocket).emit('friend:incoming_request', { fromUserId: userId });
+            if (typeof cb === 'function') cb({ success: true, friendId });
 
-            callback({ success: true });
+            const targetSocket = onlineUsers.get(friendId);
+            if (targetSocket) {
+                io.to(targetSocket).emit('friend:incoming_request', { fromUserId: userId });
+            }
         } catch (err) {
-            callback({ success: false, error: err.message });
+            if (typeof cb === 'function') cb({ success: false, error: err.message });
         }
     });
 
-    socket.on('friend:list', async () => {
+    // -------- FRIEND LIST --------
+    socket.on('friend:list', async (data, cb) => {
+        if (typeof data === 'function') {
+            cb = data;
+            data = {};
+        }
+
         const userId = activeSockets.get(socket.id);
-        if (!userId) return socket.emit('friend:list:response', { success: false, error: "Not logged in" });
+        if (!userId) {
+            if (typeof cb === 'function') cb({ success: false, error: "Not logged in" });
+            return;
+        }
 
         try {
             // Sent Requests
-            const { rows: sent } = await db.query(`
+            const [sent] = await db.execute(`
                 SELECT u.id, u.name, u.email, u.profile_pic, f.status, 1 as is_sender 
                 FROM friends f 
                 JOIN users u ON f.friend_id = u.id 
-                WHERE f.user_id = $1`, [userId]);
+                WHERE f.user_id = ?
+            `, [userId]);
 
             // Received Requests
-            const { rows: received } = await db.query(`
+            const [received] = await db.execute(`
                 SELECT u.id, u.name, u.email, u.profile_pic, f.status, 0 as is_sender 
                 FROM friends f 
                 JOIN users u ON f.user_id = u.id 
-                WHERE f.friend_id = $1`, [userId]);
+                WHERE f.friend_id = ?
+            `, [userId]);
 
-            const allFriends = [...sent, ...received];
-            socket.emit('friend:list:response', { success: true, friends: allFriends });
+            let friends = [...sent, ...received];
+
+            // Inject online status
+            friends = friends.map(f => ({
+                ...f,
+                is_online: onlineUsers.has(f.id)
+            }));
+
+            const response = { success: true, friends };
+            if (typeof cb === 'function') cb(response);
+            socket.emit('friend:list:response', response);
         } catch (err) {
-            console.error(err);
-            socket.emit('friend:list:response', { success: false, error: err.message });
+            const errorRes = { success: false, error: err.message };
+            if (typeof cb === 'function') cb(errorRes);
+            socket.emit('friend:list:response', errorRes);
         }
     });
 
-    socket.on('friend:respond', async ({ friendId, accept }, callback) => {
+    // -------- FRIEND RESPOND --------
+    socket.on('friend:respond', async ({ friendId, accept }, cb) => {
         const userId = activeSockets.get(socket.id);
-        if (!userId) return callback({ success: false, error: "Not logged in" });
+        if (!userId) {
+            if (typeof cb === 'function') cb({ success: false, error: "Not logged in" });
+            return;
+        }
 
         try {
-            // Update where REQUEST was made (requester=friendId, recipient=userId)
-            // Or allow responding if YOU made request? No.
-            // But we need to find the record.
-            // Simplified: Find record between these two.
-
             if (accept) {
-                // We update 'pending' to 'accepted'
-                // But specifically we want to match correct direction if possible, or just any direction?
-                // Safest to update where EITHER (u=me, f=him) OR (u=him, f=me).
-                await db.query(`
-                    UPDATE friends SET status = 'accepted' 
-                    WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)
-                `, [userId, friendId]);
+                await db.execute(
+                    "UPDATE friends SET status = 'accepted' WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
+                    [userId, friendId, friendId, userId]
+                );
             } else {
-                await db.query(`
-                    DELETE FROM friends 
-                    WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)
-                `, [userId, friendId]);
+                await db.execute(
+                    "DELETE FROM friends WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
+                    [userId, friendId, friendId, userId]
+                );
             }
-            if (typeof callback === 'function') callback({ success: true });
 
-            socket.emit('friend:list:refresh');
             const targetSocket = onlineUsers.get(friendId);
             if (targetSocket) io.to(targetSocket).emit('friend:list:refresh');
+            socket.emit('friend:list:refresh');
+
+            if (typeof cb === 'function') cb({ success: true });
         } catch (err) {
-            callback({ success: false, error: err.message });
+            if (typeof cb === 'function') cb({ success: false, error: err.message });
         }
     });
 
-    // --- CHAT ---
-    socket.on('chat:send', async ({ toUserId, message }, callback) => {
+    // -------- USER SEARCH --------
+    socket.on('user:search', async ({ query }, cb) => {
         const userId = activeSockets.get(socket.id);
-        if (!userId) return callback({ success: false });
+        if (!userId) {
+            if (typeof cb === 'function') cb({ success: false, error: "Not logged in" });
+            return;
+        }
 
         try {
-            // Check friendship (simple count)
-            const { rows } = await db.query(`
-                SELECT 1 FROM friends 
-                WHERE ((user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)) 
-                AND status = 'accepted'`, [userId, toUserId]);
+            const search = `%${query}%`;
+            const [users] = await db.execute(
+                "SELECT id, name, email, profile_pic FROM users WHERE (name LIKE ? OR email LIKE ?) AND id != ? LIMIT 20",
+                [search, search, userId]
+            );
+            if (typeof cb === 'function') cb({ success: true, users });
+        } catch (err) {
+            if (typeof cb === 'function') cb({ success: false, error: err.message });
+        }
+    });
 
-            if (rows.length === 0) return callback({ success: false, error: "Not friends" });
+    // -------- CHAT SEND --------
+    socket.on('chat:send', async ({ toUserId, message }, cb) => {
+        const userId = activeSockets.get(socket.id);
+        if (!userId) {
+            if (typeof cb === 'function') cb({ success: false });
+            return;
+        }
 
-            await db.query('INSERT INTO messages (sender_id, receiver_id, message) VALUES ($1, $2, $3)', [userId, toUserId, message]);
+        try {
+            await db.execute(
+                "INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)",
+                [userId, toUserId, message]
+            );
 
             const targetSocket = onlineUsers.get(toUserId);
-            if (targetSocket) io.to(targetSocket).emit('chat:receive', { fromUserId: userId, message });
+            if (targetSocket) {
+                io.to(targetSocket).emit('chat:receive', { fromUserId: userId, message });
+            } else {
+                // Send Push Notification if recipient is offline
+                try {
+                    const [users] = await db.execute("SELECT fcm_token FROM users WHERE id = ?", [toUserId]);
+                    const fcmToken = users[0]?.fcm_token;
+                    if (fcmToken) {
+                        firebase.messaging().send({
+                            token: fcmToken,
+                            notification: { title: "New Message", body: message },
+                            data: { type: "chat", senderId: userId.toString() },
+                            android: { priority: "high" }
+                        });
+                    }
+                } catch (fcmErr) {
+                    console.error("FCM Error:", fcmErr.message);
+                }
+            }
 
-            callback({ success: true });
+            if (typeof cb === 'function') cb({ success: true });
         } catch (err) {
-            callback({ success: false, error: err.message });
+            if (typeof cb === 'function') cb({ success: false, error: err.message });
         }
     });
 
-    socket.on('chat:history', async ({ withUserId }, callback) => {
+    // -------- CHAT HISTORY --------
+    socket.on('chat:history', async ({ withUserId }, cb) => {
         const userId = activeSockets.get(socket.id);
-        if (!userId) return callback({ success: false });
+        if (!userId) {
+            if (typeof cb === 'function') cb({ success: false });
+            return;
+        }
 
         try {
-            const { rows } = await db.query(`
-                SELECT id, sender_id, receiver_id, message, timestamp 
-                FROM messages 
-                WHERE (sender_id = $1 AND receiver_id = $2) 
-                   OR (sender_id = $2 AND receiver_id = $1)
-                ORDER BY timestamp ASC`, [userId, withUserId]);
-            callback({ success: true, messages: rows });
+            const [messages] = await db.execute(
+                "SELECT * FROM messages WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?) ORDER BY timestamp ASC",
+                [userId, withUserId, withUserId, userId]
+            );
+            if (typeof cb === 'function') cb({ success: true, messages });
         } catch (err) {
-            callback({ success: false, error: err.message });
+            if (typeof cb === 'function') cb({ success: false, error: err.message });
         }
     });
 
-    // --- CALLS ---
+    // -------- CALL SIGNALING --------
     socket.on('call:request', async ({ toUserId, offer }) => {
         const userId = activeSockets.get(socket.id);
-        // Verify friendship? Yes.
         const targetSocket = onlineUsers.get(toUserId);
         if (targetSocket) {
             io.to(targetSocket).emit('call:incoming', { fromUserId: userId, offer });
+        } else {
+            // Send Push for Call
+            try {
+                const [users] = await db.execute("SELECT fcm_token FROM users WHERE id = ?", [toUserId]);
+                const fcmToken = users[0]?.fcm_token;
+                if (fcmToken) {
+                    firebase.messaging().send({
+                        token: fcmToken,
+                        notification: { title: "Incoming Call", body: "Someone is calling you..." },
+                        data: { type: "call", senderId: userId.toString() },
+                        android: { priority: "high" }
+                    });
+                }
+            } catch (fcmErr) {
+                console.error("FCM Error:", fcmErr.message);
+            }
         }
     });
 
@@ -328,16 +360,16 @@ io.on('connection', (socket) => {
         }
     });
 
+    // -------- DISCONNECT --------
     socket.on('disconnect', () => {
         const userId = activeSockets.get(socket.id);
-        if (userId) {
-            activeSockets.delete(socket.id);
-            onlineUsers.delete(userId);
-            console.log(`User ${userId} disconnected`);
-        }
+        if (userId) onlineUsers.delete(userId);
+        activeSockets.delete(socket.id);
+        console.log("Disconnected:", socket.id);
     });
 });
 
+// ---------------- SERVER ----------------
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
