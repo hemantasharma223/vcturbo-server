@@ -18,6 +18,16 @@ const io = new Server(server, {
 
 app.use(express.json());
 
+// ---------------- ROUTES ----------------
+app.get('/', (req, res) => {
+    res.send("<h1>VC Turbo Server is Live!</h1><p>The socket server is running on port " + PORT + "</p>");
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: "ok", message: "MeetLoop Server is operational" });
+});
+
+
 // ---------------- STATE ----------------
 const activeSockets = new Map(); // socketId -> userId
 const onlineUsers = new Map();   // userId -> socketId
