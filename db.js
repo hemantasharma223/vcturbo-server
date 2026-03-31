@@ -3,12 +3,13 @@ require('dotenv').config();
 
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'u380941797_vcturbo',
-    password: process.env.DB_PASSWORD || 'Bhurtel1212@',
-    database: process.env.DB_NAME || 'u380941797_vcturbo',
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
 });
+
 
 module.exports = pool;

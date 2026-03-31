@@ -329,6 +329,15 @@ io.on('connection', (socket) => {
 
 // ---------------- SERVER ----------------
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
+    
+    // Test DB connection on startup
+    try {
+        await db.query("SELECT 1");
+        console.log("Database connected successfully!");
+    } catch (err) {
+        console.error("Database connection failed!", err.message);
+    }
 });
+
