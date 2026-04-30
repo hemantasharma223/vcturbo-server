@@ -46,18 +46,18 @@ io.on('connection', (socket) => {
             }
 
             // Check if email exists
-            const [existing] = await db.execute("SELECT id FROM users WHERE email = ?", [email]);
-            if (existing.length > 0) {
+            const existing = await db.query("SELECT id FROM users WHERE email = $1", [email]);
+            if (existing.rows.length > 0) {
                 if (typeof cb === 'function') cb({ success: false, error: "Email already exists" });
                 return;
             }
 
-            const [result] = await db.execute(
-                "INSERT INTO users (name, email, password) VALUES (?, ?, ?)", 
+            const result = await db.query(
+                "INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id", 
                 [name, email, password]
             );
 
-            if (typeof cb === 'function') cb({ success: true, userId: result.insertId });
+            if (typeof cb === 'function') cb({ success: true, userId: result.rows[0].id });
         } catch (err) {
             if (typeof cb === 'function') cb({ success: false, error: err.message });
         }
@@ -71,8 +71,8 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            const [rows] = await db.execute(
-                "SELECT id, name, email, profile_pic FROM users WHERE email = ? AND password = ?", 
+            const { rows } = await db.query(
+                "SELECT id, name, email, profile_pic FROM users WHERE email = $1 AND password = $2", 
                 [email, password]
             );
 
@@ -112,7 +112,7 @@ io.on('connection', (socket) => {
 
             // Find via email if friendId not provided
             if (!friendId && data.toEmail) {
-                const [users] = await db.execute("SELECT id FROM users WHERE email = ?", [data.toEmail]);
+                const { rows: users } = await db.query("SELECT id FROM users WHERE email = $1", [data.toEmail]);
                 if (users.length === 0) {
                     if (typeof cb === 'function') cb({ success: false, error: "User not found" });
                     return;
@@ -126,13 +126,13 @@ io.on('connection', (socket) => {
             }
 
             // Check existing
-            const [existing] = await db.execute(
-                "SELECT status FROM friends WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
+            const existing = await db.query(
+                "SELECT status FROM friends WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $3 AND friend_id = $4)",
                 [userId, friendId, friendId, userId]
             );
 
-            if (existing.length > 0) {
-                const status = existing[0].status;
+            if (existing.rows.length > 0) {
+                const status = existing.rows[0].status;
                 if (status === 'accepted') {
                     if (typeof cb === 'function') cb({ success: false, error: "Already friends" });
                 } else {
@@ -142,8 +142,8 @@ io.on('connection', (socket) => {
             }
 
             // Insert request
-            await db.execute(
-                "INSERT INTO friends (user_id, friend_id, status) VALUES (?, ?, 'pending')",
+            await db.query(
+                "INSERT INTO friends (user_id, friend_id, status) VALUES ($1, $2, 'pending')",
                 [userId, friendId]
             );
 
@@ -173,19 +173,19 @@ io.on('connection', (socket) => {
 
         try {
             // Sent Requests
-            const [sent] = await db.execute(`
+            const { rows: sent } = await db.query(`
                 SELECT u.id, u.name, u.email, u.profile_pic, f.status, 1 as is_sender 
                 FROM friends f 
                 JOIN users u ON f.friend_id = u.id 
-                WHERE f.user_id = ?
+                WHERE f.user_id = $1
             `, [userId]);
 
             // Received Requests
-            const [received] = await db.execute(`
+            const { rows: received } = await db.query(`
                 SELECT u.id, u.name, u.email, u.profile_pic, f.status, 0 as is_sender 
                 FROM friends f 
                 JOIN users u ON f.user_id = u.id 
-                WHERE f.friend_id = ?
+                WHERE f.friend_id = $1
             `, [userId]);
 
             let friends = [...sent, ...received];
@@ -216,13 +216,13 @@ io.on('connection', (socket) => {
 
         try {
             if (accept) {
-                await db.execute(
-                    "UPDATE friends SET status = 'accepted' WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
+                await db.query(
+                    "UPDATE friends SET status = 'accepted' WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $3 AND friend_id = $4)",
                     [userId, friendId, friendId, userId]
                 );
             } else {
-                await db.execute(
-                    "DELETE FROM friends WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
+                await db.query(
+                    "DELETE FROM friends WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $3 AND friend_id = $4)",
                     [userId, friendId, friendId, userId]
                 );
             }
@@ -247,8 +247,8 @@ io.on('connection', (socket) => {
 
         try {
             const search = `%${query}%`;
-            const [users] = await db.execute(
-                "SELECT id, name, email, profile_pic FROM users WHERE (name LIKE ? OR email LIKE ?) AND id != ? LIMIT 20",
+            const { rows: users } = await db.query(
+                "SELECT id, name, email, profile_pic FROM users WHERE (name LIKE $1 OR email LIKE $2) AND id != $3 LIMIT 20",
                 [search, search, userId]
             );
             if (typeof cb === 'function') cb({ success: true, users });
@@ -266,8 +266,8 @@ io.on('connection', (socket) => {
         }
 
         try {
-            await db.execute(
-                "INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)",
+            await db.query(
+                "INSERT INTO messages (sender_id, receiver_id, message) VALUES ($1, $2, $3)",
                 [userId, toUserId, message]
             );
 
@@ -292,8 +292,8 @@ io.on('connection', (socket) => {
         }
 
         try {
-            const [messages] = await db.execute(
-                "SELECT * FROM messages WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?) ORDER BY timestamp ASC",
+            const { rows: messages } = await db.query(
+                "SELECT * FROM messages WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $3 AND receiver_id = $4) ORDER BY timestamp ASC",
                 [userId, withUserId, withUserId, userId]
             );
             if (typeof cb === 'function') cb({ success: true, messages });
@@ -344,8 +344,34 @@ server.listen(PORT, async () => {
     
     // Test DB connection on startup
     try {
-        await db.query("SELECT 1");
-        console.log("Database connected successfully!");
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                profile_pic TEXT
+            );
+        `);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS friends (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                friend_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                status VARCHAR(50) NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                receiver_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                message TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        console.log("Database connected and tables created successfully!");
     } catch (err) {
         console.error("Database connection failed!", err.message);
     }
