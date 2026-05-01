@@ -31,6 +31,8 @@ app.get('/health', (req, res) => {
 // ---------------- STATE ----------------
 const activeSockets = new Map(); // socketId -> userId
 const onlineUsers = new Map();   // userId -> socketId
+let waitingQueue = [];           // [{ socketId, country }]
+const activeMatches = new Map(); // socketId -> peerSocketId
 
 // ---------------- SOCKET ----------------
 io.on('connection', (socket) => {
@@ -99,233 +101,74 @@ io.on('connection', (socket) => {
 
 
 
-    // -------- FRIEND REQUEST --------
-    socket.on('friend:request', async (data, cb) => {
-        const userId = activeSockets.get(socket.id);
-        if (!userId) {
-            if (typeof cb === 'function') cb({ success: false, error: "Not logged in" });
-            return;
-        }
+    // -------- RANDOM MATCHMAKING --------
+    socket.on('random:join', ({ country }) => {
+        // Remove from waiting queue if already there
+        waitingQueue = waitingQueue.filter(u => u.socketId !== socket.id);
+        
+        if (waitingQueue.length > 0) {
+            // Simple match: just pop the first user (can add country filter later)
+            const peer = waitingQueue.shift();
+            
+            activeMatches.set(socket.id, peer.socketId);
+            activeMatches.set(peer.socketId, socket.id);
 
-        try {
-            let friendId = data.friendId;
-
-            // Find via email if friendId not provided
-            if (!friendId && data.toEmail) {
-                const { rows: users } = await db.query("SELECT id FROM users WHERE email = $1", [data.toEmail]);
-                if (users.length === 0) {
-                    if (typeof cb === 'function') cb({ success: false, error: "User not found" });
-                    return;
-                }
-                friendId = users[0].id;
-            }
-
-            if (userId == friendId) {
-                if (typeof cb === 'function') cb({ success: false, error: "Cannot add yourself" });
-                return;
-            }
-
-            // Check existing
-            const existing = await db.query(
-                "SELECT status FROM friends WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $3 AND friend_id = $4)",
-                [userId, friendId, friendId, userId]
-            );
-
-            if (existing.rows.length > 0) {
-                const status = existing.rows[0].status;
-                if (status === 'accepted') {
-                    if (typeof cb === 'function') cb({ success: false, error: "Already friends" });
-                } else {
-                    if (typeof cb === 'function') cb({ success: false, error: "Request pending" });
-                }
-                return;
-            }
-
-            // Insert request
-            await db.query(
-                "INSERT INTO friends (user_id, friend_id, status) VALUES ($1, $2, 'pending')",
-                [userId, friendId]
-            );
-
-            if (typeof cb === 'function') cb({ success: true, friendId });
-
-            const targetSocket = onlineUsers.get(friendId);
-            if (targetSocket) {
-                io.to(targetSocket).emit('friend:incoming_request', { fromUserId: userId });
-            }
-        } catch (err) {
-            if (typeof cb === 'function') cb({ success: false, error: err.message });
+            // Notify both users of the match
+            socket.emit('random:match', { peerId: peer.socketId, initiator: true });
+            io.to(peer.socketId).emit('random:match', { peerId: socket.id, initiator: false });
+        } else {
+            // Join queue
+            waitingQueue.push({ socketId: socket.id, country: country });
         }
     });
 
-    // -------- FRIEND LIST --------
-    socket.on('friend:list', async (data, cb) => {
-        if (typeof data === 'function') {
-            cb = data;
-            data = {};
-        }
-
-        const userId = activeSockets.get(socket.id);
-        if (!userId) {
-            if (typeof cb === 'function') cb({ success: false, error: "Not logged in" });
-            return;
-        }
-
-        try {
-            // Sent Requests
-            const { rows: sent } = await db.query(`
-                SELECT u.id, u.name, u.email, u.profile_pic, f.status, 1 as is_sender 
-                FROM friends f 
-                JOIN users u ON f.friend_id = u.id 
-                WHERE f.user_id = $1
-            `, [userId]);
-
-            // Received Requests
-            const { rows: received } = await db.query(`
-                SELECT u.id, u.name, u.email, u.profile_pic, f.status, 0 as is_sender 
-                FROM friends f 
-                JOIN users u ON f.user_id = u.id 
-                WHERE f.friend_id = $1
-            `, [userId]);
-
-            let friends = [...sent, ...received];
-
-            // Inject online status
-            friends = friends.map(f => ({
-                ...f,
-                is_online: onlineUsers.has(f.id)
-            }));
-
-            const response = { success: true, friends };
-            if (typeof cb === 'function') cb(response);
-            socket.emit('friend:list:response', response);
-        } catch (err) {
-            const errorRes = { success: false, error: err.message };
-            if (typeof cb === 'function') cb(errorRes);
-            socket.emit('friend:list:response', errorRes);
+    socket.on('random:leave', () => {
+        waitingQueue = waitingQueue.filter(u => u.socketId !== socket.id);
+        
+        const peerId = activeMatches.get(socket.id);
+        if (peerId) {
+            activeMatches.delete(socket.id);
+            activeMatches.delete(peerId);
+            io.to(peerId).emit('random:peer_left');
         }
     });
 
-    // -------- FRIEND RESPOND --------
-    socket.on('friend:respond', async ({ friendId, accept }, cb) => {
-        const userId = activeSockets.get(socket.id);
-        if (!userId) {
-            if (typeof cb === 'function') cb({ success: false, error: "Not logged in" });
-            return;
+    socket.on('random:next', ({ country }) => {
+        // Leave current match
+        const peerId = activeMatches.get(socket.id);
+        if (peerId) {
+            activeMatches.delete(socket.id);
+            activeMatches.delete(peerId);
+            io.to(peerId).emit('random:peer_left');
         }
+        
+        // Rejoin queue
+        waitingQueue = waitingQueue.filter(u => u.socketId !== socket.id);
+        
+        if (waitingQueue.length > 0) {
+            const peer = waitingQueue.shift();
+            
+            activeMatches.set(socket.id, peer.socketId);
+            activeMatches.set(peer.socketId, socket.id);
 
-        try {
-            if (accept) {
-                await db.query(
-                    "UPDATE friends SET status = 'accepted' WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $3 AND friend_id = $4)",
-                    [userId, friendId, friendId, userId]
-                );
-            } else {
-                await db.query(
-                    "DELETE FROM friends WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $3 AND friend_id = $4)",
-                    [userId, friendId, friendId, userId]
-                );
-            }
-
-            const targetSocket = onlineUsers.get(friendId);
-            if (targetSocket) io.to(targetSocket).emit('friend:list:refresh');
-            socket.emit('friend:list:refresh');
-
-            if (typeof cb === 'function') cb({ success: true });
-        } catch (err) {
-            if (typeof cb === 'function') cb({ success: false, error: err.message });
+            socket.emit('random:match', { peerId: peer.socketId, initiator: true });
+            io.to(peer.socketId).emit('random:match', { peerId: socket.id, initiator: false });
+        } else {
+            waitingQueue.push({ socketId: socket.id, country: country });
         }
     });
 
-    // -------- USER SEARCH --------
-    socket.on('user:search', async ({ query }, cb) => {
-        const userId = activeSockets.get(socket.id);
-        if (!userId) {
-            if (typeof cb === 'function') cb({ success: false, error: "Not logged in" });
-            return;
-        }
-
-        try {
-            const search = `%${query}%`;
-            const { rows: users } = await db.query(
-                "SELECT id, name, email, profile_pic FROM users WHERE (name LIKE $1 OR email LIKE $2) AND id != $3 LIMIT 20",
-                [search, search, userId]
-            );
-            if (typeof cb === 'function') cb({ success: true, users });
-        } catch (err) {
-            if (typeof cb === 'function') cb({ success: false, error: err.message });
-        }
+    // -------- WEBRTC SIGNALING --------
+    socket.on('call:offer', ({ toSocketId, offer }) => {
+        io.to(toSocketId).emit('call:offer', { fromSocketId: socket.id, offer });
     });
 
-    // -------- CHAT SEND --------
-    socket.on('chat:send', async ({ toUserId, message }, cb) => {
-        const userId = activeSockets.get(socket.id);
-        if (!userId) {
-            if (typeof cb === 'function') cb({ success: false });
-            return;
-        }
-
-        try {
-            await db.query(
-                "INSERT INTO messages (sender_id, receiver_id, message) VALUES ($1, $2, $3)",
-                [userId, toUserId, message]
-            );
-
-            const targetSocket = onlineUsers.get(toUserId);
-            if (targetSocket) {
-                io.to(targetSocket).emit('chat:receive', { fromUserId: userId, message });
-            }
-
-
-            if (typeof cb === 'function') cb({ success: true });
-        } catch (err) {
-            if (typeof cb === 'function') cb({ success: false, error: err.message });
-        }
+    socket.on('call:answer', ({ toSocketId, answer }) => {
+        io.to(toSocketId).emit('call:answer', { fromSocketId: socket.id, answer });
     });
 
-    // -------- CHAT HISTORY --------
-    socket.on('chat:history', async ({ withUserId }, cb) => {
-        const userId = activeSockets.get(socket.id);
-        if (!userId) {
-            if (typeof cb === 'function') cb({ success: false });
-            return;
-        }
-
-        try {
-            const { rows: messages } = await db.query(
-                "SELECT * FROM messages WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $3 AND receiver_id = $4) ORDER BY timestamp ASC",
-                [userId, withUserId, withUserId, userId]
-            );
-            if (typeof cb === 'function') cb({ success: true, messages });
-        } catch (err) {
-            if (typeof cb === 'function') cb({ success: false, error: err.message });
-        }
-    });
-
-    // -------- CALL SIGNALING --------
-    socket.on('call:request', async ({ toUserId, offer }) => {
-        const userId = activeSockets.get(socket.id);
-        const targetSocket = onlineUsers.get(toUserId);
-        if (targetSocket) {
-            io.to(targetSocket).emit('call:incoming', { fromUserId: userId, offer });
-        }
-
-    });
-
-    socket.on('call:answer', ({ toUserId, answer }) => {
-        const userId = activeSockets.get(socket.id);
-        const targetSocket = onlineUsers.get(toUserId);
-        if (targetSocket) {
-            io.to(targetSocket).emit('call:answer', { fromUserId: userId, answer });
-        }
-    });
-
-    socket.on('call:ice-candidate', ({ toUserId, candidate }) => {
-        const userId = activeSockets.get(socket.id);
-        const targetSocket = onlineUsers.get(toUserId);
-        if (targetSocket) {
-            io.to(targetSocket).emit('call:ice-candidate', { fromUserId: userId, candidate });
-        }
+    socket.on('call:ice-candidate', ({ toSocketId, candidate }) => {
+        io.to(toSocketId).emit('call:ice-candidate', { fromSocketId: socket.id, candidate });
     });
 
     // -------- DISCONNECT --------
@@ -333,6 +176,18 @@ io.on('connection', (socket) => {
         const userId = activeSockets.get(socket.id);
         if (userId) onlineUsers.delete(userId);
         activeSockets.delete(socket.id);
+        
+        // Remove from queue
+        waitingQueue = waitingQueue.filter(u => u.socketId !== socket.id);
+        
+        // Disconnect peer if active
+        const peerId = activeMatches.get(socket.id);
+        if (peerId) {
+            activeMatches.delete(socket.id);
+            activeMatches.delete(peerId);
+            io.to(peerId).emit('random:peer_left');
+        }
+        
         console.log("Disconnected:", socket.id);
     });
 });
