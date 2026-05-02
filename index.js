@@ -1,6 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const axios = require('axios');
 require('dotenv').config();
 
 const db = require('./db');
@@ -16,7 +17,7 @@ const io = new Server(server, {
     }
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '5mb' })); // Allow base64 image frames
 
 // ---------------- ROUTES ----------------
 app.get('/', (req, res) => {
@@ -25,6 +26,26 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
     res.json({ status: "ok", message: "MeetLoop Server is operational" });
+});
+
+// ---------------- MODERATION PROXY ----------------
+// Flutter sends frames here; we forward to the Python service
+app.post('/moderation/check', async (req, res) => {
+    try {
+        const { image } = req.body;
+        if (!image) return res.status(400).json({ safe: true, reason: null });
+
+        const moderationUrl = process.env.MODERATION_URL || 'http://localhost:8000';
+        const response = await axios.post(`${moderationUrl}/analyze`, { image }, {
+            timeout: 4000, // 4s timeout – if moderation is slow, fail open
+        });
+
+        return res.json(response.data);
+    } catch (err) {
+        // Fail open: if moderation service is down, don't block users
+        console.error('Moderation proxy error:', err.message);
+        return res.json({ safe: true, reason: null });
+    }
 });
 
 
